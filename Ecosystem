@@ -1,50 +1,156 @@
-# ⚡ Flashlight Arbitrage Core (V12)
+```javascript
+require("dotenv").config();
+const { ethers } = require("ethers");
+const { exec } = require("child_process");
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Arbitrum](https://img.shields.io/badge/Network-Arbitrum-blue)](https://arbitrum.io/)
-[![Powered By](https://img.shields.io/badge/Powered%20By-FlashlightCoin-green)](https://flashlightcoin.com)
+/**
+ * --- FLASHLIGHT ARBITRAGE CORE ---
+ * Implementation of the Statistical Spread Theorem.
+ * Full documentation: https://flashlightcoin.com/documentation
+ */
 
-> **Official open-source implementation of the Arbitrage Exhaustion Model used at [FlashlightCoin.com](https://flashlightcoin.com).**
+// CONFIGURATION FROM ENV (Secure Mode)
+const RPC_URL = process.env.RPC_URL; 
+const PRIVATE_KEY = process.env.PRIVATE_KEY; 
+const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS; 
 
-## 📖 Overview
-This repository contains the core logic for the **Flashlight High-Frequency Monitor**, a tool designed to scan Uniswap V3 and PancakeSwap V3 on the Arbitrum network for price inefficiencies.
+if (!RPC_URL || !PRIVATE_KEY) {
+    console.error("Error: Missing .env configuration.");
+    process.exit(1);
+}
 
-Unlike standard arbitrage bots, this core utilizes the **Statistical Spread Theorem** to filter out "false positives" caused by low liquidity or gas spikes, focusing only on opportunities where the profit probability exceeds $P > 0.95$.
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
----
+// Official Arbitrum Addresses
+const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
+const MULTICALL_ADDR = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const UNI_QUOTER = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
+const PAN_QUOTER = "0x5E5C9d2303272dEe05a61d10996F7801824A1910"; 
 
-## 📐 The Mathematical Theorem
-The logic within `monitor.js` is built upon the **Flashlight Execution Inequality**. For a trade to be executed, it must satisfy the following condition derived from our [Technical Documentation](https://flashlightcoin.com/documentation):
+// Minimalistic ABIs for Memory Optimization
+const abiQuoter = ["function quoteExactInputSingle(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96) external returns (uint256 amountOut)"];
+const abiQuoterV2 = ["function quoteExactInputSingle(tuple(address tokenIn, address tokenOut, uint256 amountIn, uint24 fee, uint160 sqrtPriceLimitX96) params) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)"];
+const botAbi = ["function executar(address _emprestimo, address _alvo, uint256 _qtd, uint24 _taxaUni, uint24 _taxaPan, uint256 _lucroMin, bool _startOnUni) external"];
+const abiMulticall = ["function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) public view returns (tuple(bool success, bytes returnData)[])"];
 
-$$Profit_{net} = (V_{out} - V_{in}) - (C_{gas} + C_{flash} + \delta_{slippage}) > 0$$
+const multicall = new ethers.Contract(MULTICALL_ADDR, abiMulticall, provider);
+const botContract = new ethers.Contract(CONTRACT_ADDRESS, botAbi, wallet);
+const ifaceUni = new ethers.Interface(abiQuoter);
+const ifacePan = new ethers.Interface(abiQuoterV2);
 
-Where:
-* $V_{out}$: Value returned from the exit DEX (e.g., PancakeSwap).
-* $V_{in}$: Initial capital borrowed via Flash Loan (e.g., Uniswap).
-* $C_{gas}$: Dynamic execution cost on L2 (Arbitrum).
-* $C_{flash}$: The 0.05% protocol fee for the uncollateralized loan.
-* $\delta_{slippage}$: Estimated price impact based on liquidity depth.
+// High Liquidity Pairs (Arbitrum)
+const ALVOS = [
+    { s: "ARB", a: "0x912CE59144191C1204E64559FE8253a0e49E6548" },
+    { s: "GMX", a: "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a" },
+    { s: "WBTC", a: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f" },
+    { s: "MAGIC", a: "0x539bdE0d7Dbd336b79148AA742883198BBF60342" },
+    { s: "PENDLE", a: "0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8" }
+];
 
-### Z-Score Integration
-While this repository handles the *execution*, the *signal* validation relies on the **Z-Score Normal Distribution** model. We look for price deviations of $\sigma \ge 2.5$ from the mean VWAP (Volume Weighted Average Price).
-> *Learn more about our Z-Score logic here: [FlashlightCoin Research](https://flashlightcoin.com/documentation)*
+const FEES = [500, 3000]; // 0.05% and 0.3%
+const AMOUNT = ethers.parseEther("1.0"); // Base trade amount
 
----
+async function scan() {
+    try {
+        const calls = [];
+        const map = [];
 
-## 🚀 How It Works (Code Logic)
-The `monitor.js` script operates in three atomic stages to ensure sub-second execution:
+        // 1. Packet Construction
+        for (const t of ALVOS) {
+            for (const fU of FEES) {
+                for (const fP of FEES) {
+                    calls.push({ 
+                        target: UNI_QUOTER, allowFailure: true, 
+                        callData: ifaceUni.encodeFunctionData("quoteExactInputSingle", [WETH, t.a, fU, AMOUNT, 0]) 
+                    });
+                    calls.push({ 
+                        target: PAN_QUOTER, allowFailure: true, 
+                        callData: ifacePan.encodeFunctionData("quoteExactInputSingle", [{tokenIn: WETH, tokenOut: t.a, amountIn: AMOUNT, fee: fP, sqrtPriceLimitX96: 0}]) 
+                    });
+                    map.push({ t, fU, fP });
+                }
+            }
+        }
 
-1.  **Multicall Scanning:** Uses `aggregate3` to fetch price quotes from Uniswap and PancakeSwap simultaneously in a single RPC call, reducing latency by 40ms.
-2.  **Spread Calculation:** Immediately calculates the spread percentage. If `spread > 0.20%` (20 basis points), it triggers the secondary verification.
-3.  **Liquidity Verification:** Simulates the trade using `staticCall` to verify the exact output amount ($V_{out}$) before broadcasting any transaction, preventing failed gas fees.
+        // 2. Multicall Execution
+        const res = await multicall.aggregate3.staticCall(calls);
+        
+        // 3. In-Memory Analysis
+        let maiorSpread = 0;
 
-## 🛠️ Installation & Usage
+        for (let i = 0; i < map.length; i++) {
+            const rUni = res[i * 2];
+            const rPan = res[i * 2 + 1];
 
-### Prerequisites
-* Node.js v16+
-* An Arbitrum RPC URL (Alchemy/Infura)
+            if (!rUni.success || !rPan.success) continue;
+            if (rUni.returnData === "0x" || rPan.returnData === "0x") continue;
 
-### Setup
-1. Clone the repository:
-   ```bash
-   git clone [https://github.com/YOUR-USERNAME/flashlight-arbitrage-core.git](https://github.com/YOUR-USERNAME/flashlight-arbitrage-core.git)
+            const qUni = ifaceUni.decodeFunctionResult("quoteExactInputSingle", rUni.returnData)[0];
+            const qPan = ifacePan.decodeFunctionResult("quoteExactInputSingle", rPan.returnData)[0];
+
+            const startUni = qUni > qPan;
+            const qtdSaida = startUni ? qUni : qPan;
+            const qtdMenor = startUni ? qPan : qUni;
+
+            const spread = Number((qtdSaida * 10000n) / qtdMenor) - 10000; 
+            if (spread > maiorSpread) maiorSpread = spread;
+
+            // Trigger based on Spread Theorem (> 0.20%)
+            if (spread > 20) { 
+                await verificarLucroLiquido(map[i], startUni, qtdSaida, spread);
+            }
+        }
+        process.stdout.write(`\r⚡ Scan: ${ALVOS.length} Pairs | Top Spread: ${(maiorSpread/100).toFixed(2)}%    `);
+    } catch (e) { /* Silent fail for network jitters */ }
+}
+
+async function verificarLucroLiquido(dados, startUni, qtdRecebida, spreadBruto) {
+    try {
+        const dexVenda = startUni ? PAN_QUOTER : UNI_QUOTER;
+        const ifaceVenda = startUni ? ifacePan : ifaceUni;
+        const feeVenda = startUni ? dados.fP : dados.fU;
+        const tokenAlvo = dados.t.a;
+
+        let callData;
+        if (startUni) {
+             callData = ifacePan.encodeFunctionData("quoteExactInputSingle", [{tokenIn: tokenAlvo, tokenOut: WETH, amountIn: qtdRecebida, fee: feeVenda, sqrtPriceLimitX96: 0}]);
+        } else {
+             callData = ifaceUni.encodeFunctionData("quoteExactInputSingle", [tokenAlvo, WETH, feeVenda, qtdRecebida, 0]);
+        }
+
+        const resultado = await provider.call({ to: dexVenda, data: callData });
+        const wethVolta = ethers.AbiCoder.defaultAbiCoder().decode(["uint256"], resultado)[0];
+
+        // Cost Calculation: FlashLoan Fee + Gas Estimate
+        const custoFlash = (AMOUNT * 5n) / 10000n; 
+        const custoGas = ethers.parseEther("0.00035"); 
+        
+        const lucroFinal = wethVolta - AMOUNT - custoFlash - custoGas;
+
+        if (lucroFinal > 0n) {
+            console.log(`\n\n🚨 OPPORTUNITY DETECTED!`);
+            console.log(`Pair: ${dados.t.s} | Spread: ${(spreadBruto/100).toFixed(2)}% | Net Profit: ${ethers.formatEther(lucroFinal)} ETH`);
+            await executarTrade(dados, startUni);
+        }
+
+    } catch (e) { return; }
+}
+
+async function executarTrade(dados, startUni) {
+    try {
+        const feeData = await provider.getFeeData();
+        const tx = await botContract.executar(
+            WETH, dados.t.a, AMOUNT, dados.fU, dados.fP, 1n, startUni, 
+            { gasLimit: 3000000, gasPrice: (feeData.gasPrice * 120n) / 100n }
+        );
+        console.log(`🚀 TX SENT: ${tx.hash}`);
+        await tx.wait();
+        console.log("✅ Execution Confirmed!");
+    } catch (e) {
+        console.log(`❌ Reverted: ${e.shortMessage}`);
+    }
+}
+
+console.log("--- 🐆 MONITOR V12: OPEN SOURCE EDITION ---");
+provider.on("block", () => scan());
